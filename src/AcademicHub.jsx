@@ -21,6 +21,7 @@ const USERS = [
   { id: "salman",    name: "Salman",    initials: "SA", color: "from-indigo-500 to-indigo-600" },
   { id: "farel",     name: "Farel",     initials: "FA", color: "from-emerald-500 to-emerald-600" },
   { id: "khaizuran", name: "Khaizuran", initials: "KH", color: "from-violet-500 to-violet-600" },
+  { id: "rangga",    name: "Rangga",    initials: "RA", color: "from-rose-500 to-rose-600" },
 ];
 
 const DAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat"];
@@ -73,6 +74,7 @@ function getUserColorKey(userId) {
   if (!u) return "indigo";
   if (u.color.includes("emerald")) return "emerald";
   if (u.color.includes("violet")) return "violet";
+  if (u.color.includes("rose")) return "rose";
   return "indigo";
 }
 
@@ -591,6 +593,7 @@ function ActivityLog({ log }) {
     indigo: "bg-indigo-100 text-indigo-700",
     emerald: "bg-emerald-100 text-emerald-700",
     violet: "bg-violet-100 text-violet-700",
+    rose: "bg-rose-100 text-rose-700",
   };
 
   const formatTime = (timestamp) => {
@@ -772,7 +775,7 @@ function Chatbot({ schedule, tasks, notes, links, activeUser }) {
 // Menggunakan SDK Resmi Google yang anti-error / jika goole tetap error maka arrow about der
       const genAI = new GoogleGenerativeAI(apiKey);
       const model = genAI.getGenerativeModel({ 
-        model: "gemini-1.5-flash",
+        model: "gemini-2.5-flash",
         systemInstruction: buildSystemPrompt({ schedule, tasks, notes, links, activeUser })
       });
 
