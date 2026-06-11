@@ -8,11 +8,12 @@ import {
   onSnapshot,
   query,
   orderBy,
+  limit,
   serverTimestamp,
   setDoc,
-  getDoc,
 } from "firebase/firestore";
 import { db } from "./firebase";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
 
@@ -51,7 +52,6 @@ const INITIAL_SCHEDULE = {
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function getDeadlineLabel(deadline) {
-  // deadline can be a Firestore Timestamp or a JS Date
   const ts = deadline?.toDate ? deadline.toDate() : new Date(deadline);
   const diff = ts - Date.now();
   const hours = Math.floor(diff / 3600000);
@@ -641,6 +641,301 @@ function LoadingScreen() {
   );
 }
 
+// ─── AI CHATBOT ───────────────────────────────────────────────────────────────
+
+function buildSystemPrompt({ schedule, tasks, notes, links, activeUser }) {
+  const today = getTodayDay();
+  const currentUser = USERS.find(u => u.id === activeUser);
+
+  const scheduleText = DAYS.map(day => {
+    const classes = (schedule[day] || []).map(c =>
+      `  - ${c.course} (${c.start}–${c.end}, ${c.mode}, ${c.mode === "OFFLINE" ? c.room || "TBD" : c.link}, Dosen: ${c.lecturer}, SKS: ${c.sks})${c.cancelled ? " [DIBATALKAN]" : ""}${c.changed ? " [JADWAL BERUBAH]" : ""}`
+    ).join("\n");
+    return `${day}:\n${classes || "  - Tidak ada kelas"}`;
+  }).join("\n");
+
+  const formatDeadline = (dl) => {
+    try {
+      const ts = dl?.toDate ? dl.toDate() : new Date(dl);
+      return ts.toLocaleString("id-ID");
+    } catch { return "N/A"; }
+  };
+
+  const tasksText = tasks.length === 0 ? "Tidak ada tugas." : tasks.map(t =>
+    `  - [${t.status}] "${t.title}" | Matkul: ${t.course} | Prioritas: ${t.priority} | Deadline: ${formatDeadline(t.deadline)} | Assignee: ${t.assignee}`
+  ).join("\n");
+
+  const notesText = notes.length === 0 ? "Tidak ada catatan." : notes.map(n =>
+    `  - "${n.title}" oleh ${n.author} (${n.date}) | Tags: ${n.tags?.join(", ") || "-"}`
+  ).join("\n");
+
+  const linksText = links.length === 0 ? "Tidak ada link." : links.map(l =>
+    `  - ${l.icon} ${l.label}: ${l.url}`
+  ).join("\n");
+
+  return `Kamu adalah Akademi, asisten AI cerdas dan ramah untuk aplikasi "Academic Hub" milik kelompok mahasiswa. Kamu berbicara dalam bahasa Indonesia yang santai, friendly, dan semangat — kayak teman kuliah yang helpful banget!
+
+KONTEKS PENGGUNA AKTIF:
+- Nama: ${currentUser?.name || "Unknown"}
+- Hari ini: ${today}
+
+DATA JADWAL KULIAH LENGKAP:
+${scheduleText}
+
+DATA TUGAS (TASKS):
+${tasksText}
+
+DATA CATATAN (NOTES):
+${notesText}
+
+QUICK LINKS:
+${linksText}
+
+INSTRUKSI PERILAKU:
+1. Jawab pertanyaan tentang jadwal, tugas, catatan, dan data di atas dengan akurat.
+2. Kalau ditanya "jadwal hari ini", cek hari "${today}" dari data jadwal.
+3. Kalau ditanya tugas mendesak, cari task dengan status bukan "Completed" dan deadline terdekat.
+4. Kamu boleh kasih saran produktivitas, tips belajar, atau motivasi kalau diminta.
+5. Selalu responsif, singkat-padat, dan pakai emoji secukupnya biar lebih hidup! 🎯
+6. Jangan keluar dari konteks data aplikasi ini — kamu adalah asisten khusus Academic Hub.`;
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex items-end gap-2 mb-3">
+      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">🤖</div>
+      <div className="bg-white/80 backdrop-blur-sm border border-white/60 rounded-2xl rounded-bl-sm px-4 py-3 shadow-sm">
+        <div className="flex items-center gap-1">
+          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+          <span className="w-2 h-2 bg-indigo-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatMessage({ msg }) {
+  const isUser = msg.role === "user";
+  return (
+    <div className={`flex items-end gap-2 mb-3 ${isUser ? "flex-row-reverse" : "flex-row"}`}
+      style={{ animation: "chatMsgIn 0.25s ease-out both" }}>
+      {!isUser && (
+        <div className="w-7 h-7 rounded-full bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">🤖</div>
+      )}
+      <div className={`max-w-[78%] px-4 py-2.5 rounded-2xl text-sm leading-relaxed shadow-sm ${
+        isUser
+          ? "bg-gradient-to-br from-indigo-500 to-indigo-600 text-white rounded-br-sm"
+          : "bg-white/80 backdrop-blur-sm border border-white/60 text-slate-700 rounded-bl-sm"
+      }`}>
+        {msg.content}
+      </div>
+    </div>
+  );
+}
+
+function Chatbot({ schedule, tasks, notes, links, activeUser }) {
+  const [open, setOpen] = useState(false);
+  const [messages, setMessages] = useState([
+    { role: "assistant", content: "Halo! 👋 Aku Akademi, asisten AI kamu di Academic Hub. Mau tanya soal jadwal, tugas, atau butuh bantuan apa nih? 😊" }
+  ]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const messagesEndRef = useRef(null);
+  const inputRef = useRef(null);
+
+  useEffect(() => {
+    if (open) {
+      setTimeout(() => inputRef.current?.focus(), 300);
+    }
+  }, [open]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, loading]);
+
+  const handleSend = async () => {
+    const text = input.trim();
+    if (!text || loading) return;
+
+    const userMsg = { role: "user", content: text };
+    setMessages(prev => [...prev, userMsg]);
+    setInput("");
+    setLoading(true);
+    setError("");
+
+    try {
+      const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+      if (!apiKey) throw new Error("API key tidak ditemukan. Tambahkan VITE_GEMINI_API_KEY di file .env kamu.");
+
+// Menggunakan SDK Resmi Google yang anti-error / jika goole tetap error maka arrow about der
+      const genAI = new GoogleGenerativeAI(apiKey);
+      const model = genAI.getGenerativeModel({ 
+        model: "gemini-1.5-flash",
+        systemInstruction: buildSystemPrompt({ schedule, tasks, notes, links, activeUser })
+      });
+
+      // Menyusun riwayat chat agar AI ingat obrolan sebelumnya
+      const history = messages.slice(1).map(m => ({
+        role: m.role === "user" ? "user" : "model",
+        parts: [{ text: m.content }],
+      }));
+
+      // Memulai sesi chat
+      const chat = model.startChat({
+        history: history,
+        generationConfig: { temperature: 0.8 },
+      });
+
+      // Mengirim pesan
+      const result = await chat.sendMessage(text);
+      const aiText = result.response.text();
+
+      setMessages(prev => [...prev, { role: "assistant", content: aiText }]);
+    } catch (err) {
+      console.error(err);
+      setError(err.message || "Terjadi kesalahan saat menghubungi AI.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  return (
+    <>
+      {/* Keyframe styles */}
+      <style>{`
+        @keyframes chatMsgIn {
+          from { opacity: 0; transform: translateY(8px) scale(0.97); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes chatWindowIn {
+          from { opacity: 0; transform: translateY(20px) scale(0.95); }
+          to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+        @keyframes fabPulse {
+          0%, 100% { box-shadow: 0 0 0 0 rgba(99,102,241,0.5); }
+          50%       { box-shadow: 0 0 0 10px rgba(99,102,241,0); }
+        }
+        .chat-window-anim {
+          animation: chatWindowIn 0.3s cubic-bezier(0.34,1.56,0.64,1) both;
+        }
+        .fab-pulse {
+          animation: fabPulse 2.5s infinite;
+        }
+      `}</style>
+
+      {/* Chat Window */}
+      {open && (
+        <div
+          className="chat-window-anim fixed bottom-24 right-6 z-50 w-[360px] max-w-[calc(100vw-3rem)] flex flex-col"
+          style={{ height: "520px" }}
+        >
+          <div className="flex flex-col h-full rounded-3xl overflow-hidden shadow-2xl border border-white/40"
+            style={{ background: "rgba(248,250,255,0.85)", backdropFilter: "blur(20px)", WebkitBackdropFilter: "blur(20px)" }}>
+
+            {/* Header */}
+            <div className="flex items-center gap-3 px-4 py-3.5 border-b border-white/50"
+              style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.95) 0%, rgba(139,92,246,0.95) 100%)", backdropFilter: "blur(10px)" }}>
+              <div className="w-9 h-9 rounded-full bg-white/20 flex items-center justify-center text-lg">🤖</div>
+              <div className="flex-1">
+                <p className="font-bold text-white text-sm">Akademi AI</p>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-1.5 h-1.5 rounded-full bg-emerald-300 animate-pulse" />
+                  <p className="text-white/80 text-[10px]">Online · Powered by Gemini 1.5 Flash</p>
+                </div>
+              </div>
+              <button onClick={() => setOpen(false)}
+                className="w-7 h-7 rounded-full bg-white/20 hover:bg-white/30 flex items-center justify-center text-white text-xs transition-colors">✕</button>
+            </div>
+
+            {/* Messages */}
+            <div className="flex-1 overflow-y-auto px-4 py-4 space-y-1" style={{ scrollbarWidth: "thin" }}>
+              {messages.map((msg, i) => (
+                <ChatMessage key={i} msg={msg} />
+              ))}
+              {loading && <TypingIndicator />}
+              {error && (
+                <div className="text-xs text-red-500 bg-red-50 rounded-xl px-3 py-2 border border-red-100">
+                  ⚠️ {error}
+                </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+
+            {/* Quick suggestions */}
+            {messages.length <= 1 && (
+              <div className="px-4 pb-2 flex flex-wrap gap-1.5">
+                {["Jadwal hari ini 📅", "Tugas mendesak ⚡", "Berapa total SKS? 📚"].map(s => (
+                  <button key={s} onClick={() => { setInput(s); inputRef.current?.focus(); }}
+                    className="text-[11px] px-2.5 py-1 rounded-full bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 transition-colors font-medium">
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Input */}
+            <div className="px-3 pb-3 pt-2 border-t border-white/50">
+              <div className="flex items-end gap-2 bg-white/70 rounded-2xl border border-white/80 shadow-sm px-3 py-2"
+                style={{ backdropFilter: "blur(10px)" }}>
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ketik pesan... (Enter untuk kirim)"
+                  rows={1}
+                  disabled={loading}
+                  className="flex-1 text-sm text-slate-700 placeholder-slate-400 bg-transparent resize-none focus:outline-none leading-relaxed disabled:opacity-50"
+                  style={{ maxHeight: "80px", overflowY: "auto" }}
+                />
+                <button
+                  onClick={handleSend}
+                  disabled={loading || !input.trim()}
+                  className="flex-shrink-0 w-8 h-8 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 text-white flex items-center justify-center text-sm transition-all hover:scale-105 active:scale-95 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:scale-100 shadow-md">
+                  {loading ? (
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                    </svg>
+                  ) : (
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+              <p className="text-[10px] text-slate-400 text-center mt-1.5">Shift+Enter untuk baris baru</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FAB */}
+      <button
+        onClick={() => setOpen(o => !o)}
+        className={`fixed bottom-6 right-6 z-50 w-14 h-14 rounded-2xl shadow-xl flex items-center justify-center text-2xl transition-all duration-300 hover:scale-110 active:scale-95 ${open ? "bg-slate-700 rotate-12" : "bg-gradient-to-br from-indigo-500 to-violet-600 fab-pulse"}`}
+        title="Chat dengan AI"
+      >
+        {open ? "✕" : "✨"}
+        {!open && messages.length > 1 && (
+          <span className="absolute -top-1 -right-1 w-5 h-5 bg-red-500 text-white text-[10px] font-bold rounded-full flex items-center justify-center">
+            {messages.filter(m => m.role === "assistant").length - 1}
+          </span>
+        )}
+      </button>
+    </>
+  );
+}
+
 // ─── MAIN APP ─────────────────────────────────────────────────────────────────
 
 export default function AcademicHub() {
@@ -674,52 +969,35 @@ export default function AcademicHub() {
   useEffect(() => {
     const unsubs = [];
 
-    // Tasks — ordered by createdAt descending
     const tasksQ = query(collection(db, "tasks"), orderBy("createdAt", "desc"));
-    unsubs.push(
-      onSnapshot(tasksQ, (snap) => {
-        setTasks(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-      })
-    );
+    unsubs.push(onSnapshot(tasksQ, (snap) => {
+      setTasks(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }));
 
-    // Notes — ordered by createdAt descending
     const notesQ = query(collection(db, "notes"), orderBy("createdAt", "desc"));
-    unsubs.push(
-      onSnapshot(notesQ, (snap) => {
-        setNotes(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-      })
-    );
+    unsubs.push(onSnapshot(notesQ, (snap) => {
+      setNotes(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }));
 
-    // Links — ordered by createdAt ascending (keeps a consistent order)
     const linksQ = query(collection(db, "links"), orderBy("createdAt", "asc"));
-    unsubs.push(
-      onSnapshot(linksQ, (snap) => {
-        setLinks(snap.docs.map(d => ({ id: d.id, ...d.data() })));
-      })
-    );
+    unsubs.push(onSnapshot(linksQ, (snap) => {
+      setLinks(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }));
 
-    // Activity — ordered by createdAt descending, limit to last 10
-    const activityQ = query(collection(db, "activity"), orderBy("createdAt", "desc"));
-    unsubs.push(
-      onSnapshot(activityQ, (snap) => {
-        setActivity(snap.docs.slice(0, 10).map(d => ({ id: d.id, ...d.data() })));
-      })
-    );
+    const activityQ = query(collection(db, "activity"), orderBy("createdAt", "desc"), limit(10));
+    unsubs.push(onSnapshot(activityQ, (snap) => {
+      setActivity(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    }));
 
-    // Schedule overrides — stored as a single document per course id
-    // We merge Firestore overrides on top of INITIAL_SCHEDULE
     unsubs.push(
       onSnapshot(collection(db, "scheduleOverrides"), (snap) => {
         const overrides = {};
         snap.docs.forEach(d => { overrides[d.id] = d.data(); });
-
-        setSchedule(prev => {
+        setSchedule(() => {
           const merged = {};
           DAYS.forEach(day => {
             merged[day] = (INITIAL_SCHEDULE[day] || []).map(item => {
-              if (overrides[item.id]) {
-                return { ...item, ...overrides[item.id] };
-              }
+              if (overrides[item.id]) return { ...item, ...overrides[item.id] };
               return item;
             });
           });
@@ -729,7 +1007,7 @@ export default function AcademicHub() {
       })
     );
 
-    return () => unsubs.forEach(u => u());
+    return () => unsubs.forEach(u => u()); //task on manager and managing
   }, []);
 
   // ── Sync pulse helper ──
@@ -756,14 +1034,11 @@ export default function AcademicHub() {
   const handleSaveSchedule = async (updated) => {
     const { item } = changeModal;
     try {
-      // Upsert override document — doc id = original course slot id
       await setDoc(doc(db, "scheduleOverrides", item.id), {
         ...updated,
         courseId: item.id,
         updatedAt: serverTimestamp(),
       }, { merge: true });
-
-      const u = USERS.find(x => x.id === activeUser);
       await logActivity(
         `mengubah jadwal '${item.course}' ke ${updated.mode}${updated.cancelled ? " (DIBATALKAN)" : ""}`,
         activeUser
@@ -881,12 +1156,10 @@ export default function AcademicHub() {
 
   return (
     <div className="min-h-screen bg-slate-50 font-sans" style={{fontFamily: "'DM Sans', 'Nunito', system-ui, sans-serif"}}>
-      {/* Mobile sidebar overlay */}
       {sidebarOpen && <div className="fixed inset-0 bg-slate-900/50 z-30 lg:hidden" onClick={() => setSidebarOpen(false)} />}
 
       {/* ── SIDEBAR ── */}
       <aside className={`fixed top-0 left-0 h-full w-64 bg-white border-r border-slate-100 z-40 flex flex-col transition-transform duration-300 ${sidebarOpen ? "translate-x-0" : "-translate-x-full"} lg:translate-x-0`}>
-        {/* Logo */}
         <div className="p-5 border-b border-slate-100">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center text-white text-lg">🎓</div>
@@ -901,7 +1174,6 @@ export default function AcademicHub() {
           </div>
         </div>
 
-        {/* User switcher */}
         <div className="p-4 border-b border-slate-100">
           <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Login Sebagai</p>
           <div className="space-y-1">
@@ -919,7 +1191,6 @@ export default function AcademicHub() {
           </div>
         </div>
 
-        {/* Navigation */}
         <nav className="flex-1 p-4 space-y-1">
           <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-3">Menu</p>
           {navItems.map(item => (
@@ -934,7 +1205,6 @@ export default function AcademicHub() {
           ))}
         </nav>
 
-        {/* Bottom stats */}
         <div className="p-4 border-t border-slate-100">
           <div className="grid grid-cols-3 gap-2">
             <div className="text-center p-2 bg-slate-50 rounded-xl">
@@ -955,7 +1225,6 @@ export default function AcademicHub() {
 
       {/* ── MAIN CONTENT ── */}
       <div className="lg:ml-64 flex flex-col min-h-screen">
-        {/* Top header */}
         <header className="sticky top-0 z-20 bg-white/90 backdrop-blur-md border-b border-slate-100 px-4 py-3 flex items-center gap-3">
           <button onClick={() => setSidebarOpen(!sidebarOpen)} className="lg:hidden w-9 h-9 rounded-xl bg-slate-100 flex items-center justify-center text-slate-600">☰</button>
           <div className="flex-1">
@@ -979,13 +1248,11 @@ export default function AcademicHub() {
           </div>
         </header>
 
-        {/* Page content */}
         <main className="flex-1 p-4 lg:p-6 space-y-6">
 
           {/* ── SCHEDULE SECTION ── */}
           {activeSection === "schedule" && (
             <div>
-              {/* Summary cards */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
                 {[
                   { label: "Total Kelas/Minggu", value: Object.values(schedule).flat().length, icon: "📚", color: "from-indigo-500 to-indigo-600" },
@@ -1003,7 +1270,6 @@ export default function AcademicHub() {
                 ))}
               </div>
 
-              {/* View toggle */}
               <div className="flex items-center gap-2 mb-5">
                 <div className="flex bg-white border border-slate-200 rounded-xl p-1 gap-1">
                   <button onClick={() => setScheduleView("weekly")}
@@ -1069,7 +1335,6 @@ export default function AcademicHub() {
             </div>
           )}
 
-          {/* Activity log & quick links - mini widget on other sections */}
           {activeSection !== "links" && (
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-slate-100">
               <div className="bg-white rounded-2xl border border-slate-100 p-4">
@@ -1083,10 +1348,10 @@ export default function AcademicHub() {
         </main>
       </div>
 
-      {/* ── FAB for tasks ── */}
+      {/* ── FAB for tasks (moved up to not clash with chatbot) ── */}
       {activeSection === "tasks" && (
         <button onClick={() => setAddTaskModal(true)}
-          className="fixed bottom-6 right-6 w-14 h-14 bg-indigo-600 text-white rounded-2xl shadow-xl shadow-indigo-300 flex items-center justify-center text-2xl hover:bg-indigo-700 transition-all hover:scale-110 z-20">
+          className="fixed bottom-24 left-6 w-14 h-14 bg-indigo-600 text-white rounded-2xl shadow-xl shadow-indigo-300 flex items-center justify-center text-2xl hover:bg-indigo-700 transition-all hover:scale-110 z-20">
           +
         </button>
       )}
@@ -1106,6 +1371,15 @@ export default function AcademicHub() {
       {addNoteModal && (
         <AddNoteModal onSave={handleAddNote} onClose={() => setAddNoteModal(false)} activeUser={activeUser} />
       )}
+
+      {/* ── AI CHATBOT ── */}
+      <Chatbot
+        schedule={schedule}
+        tasks={tasks}
+        notes={notes}
+        links={links}
+        activeUser={activeUser}
+      />
     </div>
   );
 }
