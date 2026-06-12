@@ -22,6 +22,7 @@ const USERS = [
   { id: "farel",     name: "Farel",     initials: "FA", color: "from-emerald-500 to-emerald-600" },
   { id: "khaizuran", name: "Khaizuran", initials: "KH", color: "from-violet-500 to-violet-600" },
   { id: "rangga",    name: "Rangga",    initials: "RA", color: "from-rose-500 to-rose-600" },
+  { id: "fachri",    name: "Fachri",    initials: "FC", color: "from-amber-500 to-amber-600" },
 ];
 
 const DAYS = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat"];
@@ -75,6 +76,7 @@ function getUserColorKey(userId) {
   if (u.color.includes("emerald")) return "emerald";
   if (u.color.includes("violet")) return "violet";
   if (u.color.includes("rose")) return "rose";
+  if (u.color.includes("amber")) return "amber";
   return "indigo";
 }
 
@@ -175,12 +177,17 @@ function AddTaskModal({ onSave, onClose }) {
   const [form, setForm] = useState({ course: "", title: "", desc: "", priority: "Medium", deadline: "", assignee: "salman" });
   const [saving, setSaving] = useState(false);
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const isBulk = form.assignee === "all";
+
   const handleSave = async () => {
     if (!form.title || !form.course) return;
     setSaving(true);
-    await onSave({ ...form, deadline: form.deadline ? new Date(form.deadline) : new Date(Date.now() + 7 * 86400000), status: "Todo" });
+    const deadline = form.deadline ? new Date(form.deadline) : new Date(Date.now() + 7 * 86400000);
+    await onSave({ ...form, deadline, status: "Todo", isBulk });
     setSaving(false);
   };
+
   return (
     <Modal open onClose={onClose} title="Tambah Tugas Baru">
       <div className="space-y-4">
@@ -210,11 +217,26 @@ function AddTaskModal({ onSave, onClose }) {
           <div className="flex-1">
             <label className="block text-xs font-semibold text-slate-600 mb-1">Penanggung Jawab</label>
             <select value={form.assignee} onChange={e => set("assignee", e.target.value)}
-              className="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-white">
+              className={`w-full px-3 py-2 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-300 bg-white transition-colors ${isBulk ? "border-indigo-400 bg-indigo-50 text-indigo-700 font-semibold" : "border-slate-200"}`}>
+              <option value="all">👥 Semua Admin (Tugas Kelompok)</option>
               {USERS.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
             </select>
           </div>
         </div>
+
+        {/* Banner info bulk assign */}
+        {isBulk && (
+          <div className="flex items-start gap-2.5 px-3 py-2.5 bg-indigo-50 border border-indigo-200 rounded-xl">
+            <span className="text-base mt-0.5">👥</span>
+            <div>
+              <p className="text-xs font-semibold text-indigo-700">Mode Tugas Kelompok</p>
+              <p className="text-[11px] text-indigo-500 mt-0.5">
+                Akan membuat <strong>{USERS.length} kartu tugas</strong> sekaligus — satu untuk masing-masing admin: {USERS.map(u => u.name).join(", ")}.
+              </p>
+            </div>
+          </div>
+        )}
+
         <div>
           <label className="block text-xs font-semibold text-slate-600 mb-1">Deadline</label>
           <input type="datetime-local" value={form.deadline} onChange={e => set("deadline", e.target.value)}
@@ -224,7 +246,11 @@ function AddTaskModal({ onSave, onClose }) {
           <button onClick={onClose} className="flex-1 py-2 rounded-xl border border-slate-200 text-slate-600 text-sm font-semibold hover:bg-slate-50 transition-colors">Batal</button>
           <button onClick={handleSave} disabled={saving}
             className="flex-1 py-2 rounded-xl bg-indigo-600 text-white text-sm font-semibold hover:bg-indigo-700 transition-colors disabled:opacity-60">
-            {saving ? "Menyimpan..." : "Tambah Tugas"}
+            {saving
+              ? "Menyimpan..."
+              : isBulk
+                ? `➕ Buat ${USERS.length} Tugas Kelompok`
+                : "Tambah Tugas"}
           </button>
         </div>
       </div>
@@ -425,6 +451,50 @@ function TaskCard({ task, onMove, onDelete }) {
   );
 }
 
+// ─── ADMIN TASK TRACKER ───────────────────────────────────────────────────────
+
+function AdminTaskTracker({ tasks }) {
+  return (
+    <div className="flex flex-wrap gap-3 p-3 bg-white rounded-2xl border border-slate-100">
+      {USERS.map(u => {
+        const pending = tasks.filter(t => t.assignee === u.id && t.status !== "Completed").length;
+        const completed = tasks.filter(t => t.assignee === u.id && t.status === "Completed").length;
+        const total = pending + completed;
+        const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+        return (
+          <div key={u.id} className="flex items-center gap-2.5 flex-1 min-w-[130px] px-3 py-2 rounded-xl bg-slate-50 hover:bg-slate-100 transition-colors">
+            <div className={`w-9 h-9 rounded-full bg-gradient-to-br ${u.color} flex items-center justify-center text-white text-xs font-bold flex-shrink-0`}>
+              {u.initials}
+            </div>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between gap-1 mb-1">
+                <p className="text-xs font-semibold text-slate-700 truncate">{u.name}</p>
+                <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full flex-shrink-0 ${
+                  pending === 0 ? "bg-emerald-100 text-emerald-700" :
+                  pending >= 3 ? "bg-red-100 text-red-600" :
+                  "bg-amber-100 text-amber-700"
+                }`}>
+                  {pending} aktif
+                </span>
+              </div>
+              {/* Progress bar */}
+              <div className="w-full h-1.5 bg-slate-200 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    pct === 100 ? "bg-emerald-400" : "bg-indigo-400"
+                  }`}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-slate-400 mt-0.5">{completed}/{total} selesai</p>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function TaskBoard({ tasks, onMove, onDelete }) {
   const cols = [
     { key: "Todo", label: "To-Do", icon: "📋", color: "text-slate-700", dot: "bg-slate-400" },
@@ -594,6 +664,7 @@ function ActivityLog({ log }) {
     emerald: "bg-emerald-100 text-emerald-700",
     violet: "bg-violet-100 text-violet-700",
     rose: "bg-rose-100 text-rose-700",
+    amber: "bg-amber-100 text-amber-700",
   };
 
   const formatTime = (timestamp) => {
@@ -1056,12 +1127,31 @@ export default function AcademicHub() {
   // ── Task handlers ──
   const handleAddTask = async (taskData) => {
     try {
-      await addDoc(collection(db, "tasks"), {
-        ...taskData,
-        deadline: taskData.deadline instanceof Date ? taskData.deadline : new Date(taskData.deadline),
-        createdAt: serverTimestamp(),
-      });
-      await logActivity(`menambahkan tugas baru '${taskData.title}'`);
+      const { isBulk, ...data } = taskData;
+      const deadline = data.deadline instanceof Date ? data.deadline : new Date(data.deadline);
+
+      if (isBulk) {
+        // Buat satu dokumen per admin secara paralel
+        await Promise.all(
+          USERS.map(u =>
+            addDoc(collection(db, "tasks"), {
+              ...data,
+              assignee: u.id,
+              deadline,
+              createdAt: serverTimestamp(),
+            })
+          )
+        );
+        await logActivity(`menambahkan tugas kelompok '${data.title}' untuk semua admin`);
+      } else {
+        await addDoc(collection(db, "tasks"), {
+          ...data,
+          deadline,
+          createdAt: serverTimestamp(),
+        });
+        await logActivity(`menambahkan tugas baru '${data.title}'`);
+      }
+
       pulse();
       setAddTaskModal(false);
     } catch (err) {
@@ -1296,7 +1386,7 @@ export default function AcademicHub() {
           {/* ── TASKS SECTION ── */}
           {activeSection === "tasks" && (
             <div>
-              <div className="flex items-center justify-between mb-5">
+              <div className="flex items-center justify-between mb-4">
                 <div className="flex items-center gap-3">
                   <div className="grid grid-cols-3 gap-2 text-center">
                     {[
@@ -1312,6 +1402,11 @@ export default function AcademicHub() {
                   className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 text-white text-sm font-bold rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200">
                   + Tambah Tugas
                 </button>
+              </div>
+              {/* Widget beban tugas per admin */}
+              <div className="mb-5">
+                <p className="text-xs font-bold text-slate-500 uppercase tracking-wide mb-2">Beban Tugas per Admin</p>
+                <AdminTaskTracker tasks={tasks} />
               </div>
               <TaskBoard tasks={tasks} onMove={handleMoveTask} onDelete={handleDeleteTask} />
             </div>
